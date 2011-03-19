@@ -86,6 +86,8 @@ use Getopt::Long;
 use DBIx::Simple;
 use Data::Dumper;
 use YAML;
+use File::Spec;
+use File::Copy;
 
 use version 0.74; our $VERSION = qv(v0.3.1);
 
@@ -115,7 +117,8 @@ GetOptions(
     
     "category_source" => \( $opt{ category_source } = "categories" ),
     
-    "attachment_dir=s" => \( $opt{ attachment_dir } = "attachments" )
+    "attachment_dir=s" => \( $opt{ attachment_dir } = "attachments" ),
+    "attachment_disk=s" => \( $opt{ attachment_disk } = "" )
 );
 
 
@@ -142,6 +145,9 @@ Options
     --attachment_dir <path>
         Direcory for outputting any attachment file.
         default: attachments (in current dir)
+	--attachment_disk <path>
+		Directory where files are stored in Mantis
+		if Mantis configured to store files on disk
     
     Import flavor:
     --category-source <source>
@@ -185,6 +191,10 @@ die "Missing: \n  ". join( ", ", @check_err ). "\nUse --help for all options\n" 
 # check attachment table
 die "No such directory '$opt{ attachment_dir }'.. please created!\n"
     unless (-d $opt{ attachment_dir } || $opt{ attachments_in_db });
+
+# check attachment source if on disk
+die "No such directory '$opt{ attachment_disk }'.. please check path to Mantis filestore!\n"
+	if ($opt { attachment_disk } && !-d $opt { attachment_disk });
 
 # check category-source
 die "Not allowed --category-source '$opt{ category_source }', use one of 'categories' or 'trackers'\n"
@@ -675,6 +685,29 @@ sub perform_import {
                     rgt         => $max+1
                 } );
                 ( $map_ref->{ projects }->{ $old_id } ) = $dbix_redmine->query( 'SELECT MAX(id) FROM projects' )->list;
+				
+				if ( $opt{ category_source } ne 'trackers' ) {
+					# Enable default trackers for Bug, Feature, Support
+					$dbix_redmine->insert( projects_trackers => {
+						project_id => $map_ref->{ projects }->{ $old_id },
+						tracker_id => 1
+					} );
+					$dbix_redmine->insert( projects_trackers => {
+						project_id => $map_ref->{ projects }->{ $old_id },
+						tracker_id => 2
+					} );
+					$dbix_redmine->insert( projects_trackers => {
+						project_id => $map_ref->{ projects }->{ $old_id },
+						tracker_id => 3
+					} );
+				}
+				
+				# Enable module Issue Tracking
+				$dbix_redmine->insert ( enabled_modules => {
+					project_id => $map_ref->{ projects }->{ $old_id },
+					name       => 'issue_tracking'
+				} );
+				
             }
             
             $report{ projects_created } ++;
@@ -827,9 +860,9 @@ SELECT
     b.severity,
     b.category_id,
     b.summary AS `subject`,
-    DATE_FORMAT( FROM_UNIXTIME( b.date_submitted ), '%Y-%m-%d %T' ) AS `created_on`,
-    DATE_FORMAT( FROM_UNIXTIME( b.date_submitted ), '%Y-%m-%d' ) AS `start_date`,
-    DATE_FORMAT( FROM_UNIXTIME( b.last_updated ), '%Y-%m-%d %T' ) AS `updated_on`,
+    DATE_FORMAT(  b.date_submitted , '%Y-%m-%d %T' ) AS `created_on`,
+    DATE_FORMAT(  b.date_submitted , '%Y-%m-%d' ) AS `start_date`,
+    DATE_FORMAT(  b.last_updated , '%Y-%m-%d %T' ) AS `updated_on`,
     CONCAT_WS( "\n\n", tt.description, tt.steps_to_reproduce, tt.additional_information ) AS `description` 
 FROM mantis_bug_table b
 LEFT JOIN mantis_bug_text_table tt ON ( tt.id = b.bug_text_id )
@@ -838,7 +871,7 @@ SQL
     my $notes_sql = <<SQLNOTES;
 SELECT
     b.reporter_id,
-    DATE_FORMAT( FROM_UNIXTIME( b.date_submitted ), '%Y-%m-%d %T' ) AS `created_on`,
+    DATE_FORMAT( b.date_submitted , '%Y-%m-%d %T' ) AS `created_on`,
     tt.note
 FROM mantis_bugnote_table b
 LEFT JOIN mantis_bugnote_text_table tt ON ( tt.id = b.bugnote_text_id )
@@ -851,7 +884,9 @@ SELECT
     b.diskfile,
     b.filename,
     b.file_type,
-    DATE_FORMAT( FROM_UNIXTIME( b.date_added ), '%Y-%m-%d %T' ) AS `created_on`,
+	b.folder,
+	REPLACE(b.diskfile, b.folder, '') as `diskfile_name`,
+    DATE_FORMAT( b.date_added , '%Y-%m-%d %T' ) AS `created_on`,
     CONCAT_WS( "\n", b.title, b.description ) AS `description`,
     b.content
 FROM mantis_bug_file_table b
@@ -926,11 +961,40 @@ SQLNOTES
         }
         
         # insert attachments
-        if (! $opt{ attachments_in_db } ) {
+        if ( $opt{ attachment_disk } ) {
             my $attachments = $dbix_mantis->query( $attachments_sql, $issue_ref->{ id } );
             while ( my $attachment_ref = $attachments->hash ) {
-                # we have the attachments in the db -> exit
-                last;
+                print "+";
+                
+                unless ( $DRY ) {
+                    
+                    # copy file
+					my $mantis_path = File::Spec->catfile( $opt{ attachment_disk }, $attachment_ref->{ diskfile_name } );
+					my $output_path = File::Spec->catfile( $opt{ attachment_dir } , $attachment_ref->{ diskfile_name } );
+					if ( ! copy ($mantis_path, $output_path) ) {
+						print "Failed to copy attachment " . $attachment_ref->{ diskfile_name } . " for issue id " . $issue_ref->{ id } . "\n";
+					}
+					
+                    # insert
+                    $dbix_redmine->insert( attachments => {
+                        container_id   => $issue_id,
+                        container_type => 'Issue',
+                        filename       => $attachment_ref->{ filename },
+                        disk_filename  =>  $attachment_ref->{ diskfile_name },
+                        filesize       => -s $output_path,
+                        content_type   => $attachment_ref->{ file_type },
+                        created_on     => $attachment_ref->{ created_on },
+                        author_id      => $admin_id,
+						description    => $attachment_ref->{ description }
+                    } );
+                }
+                $report{ attachments_created } ++;
+            }
+        } else {
+        	# we have the attachments in the db -> exit
+			# DON'T KNOW IF THIS WORKS
+            my $attachments = $dbix_mantis->query( $attachments_sql, $issue_ref->{ id } );
+            while ( my $attachment_ref = $attachments->hash ) {
                 print "+";
                 
                 unless ( $DRY ) {
@@ -952,13 +1016,12 @@ SQLNOTES
                         filesize       => -s $output,
                         content_type   => $attachment_ref->{ file_type },
                         created_on     => $attachment_ref->{ created_on },
-                        author_id      => $admin_id
+                        author_id      => $admin_id,
+						description    => $attachment_ref->{ description }
                     } );
                 }
                 $report{ attachments_created } ++;
-            }
-        } else {
-        	# we have the attachments in the db -> exit
+			}
         }
     }
     print "OK\n";
@@ -1066,6 +1129,12 @@ SQLRELATIONS
         
         $report{ custom_fields_created } ++;
     }
+	
+	# patch issue records
+	unless ( $DRY ) {
+		$dbix_redmine->query( 'UPDATE issues SET root_id = id, lft = 1, rgt = 2 WHERE COALESCE(root_id, lft, rgt) IS NULL;' );
+	}
+	
     print "OK\n";
     
     print "\n\nAll Done\n";
